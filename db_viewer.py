@@ -177,17 +177,20 @@ class DatabaseWindow(tk.Toplevel):
         self._tab_coatings   = tk.Frame(nb, bg=BG)
         self._tab_export     = tk.Frame(nb, bg=BG)
         self._tab_surrogate  = tk.Frame(nb, bg=BG)
+        self._tab_targets    = tk.Frame(nb, bg=BG)
         nb.add(self._tab_materials, text="Материалы")
         nb.add(self._tab_runs,      text="Прогоны")
         nb.add(self._tab_coatings,  text="Покрытия")
         nb.add(self._tab_export,    text="Экспорт датасета")
         nb.add(self._tab_surrogate, text="ML-суррогат")
+        nb.add(self._tab_targets,   text="История целей")
 
         self._build_materials_tab()
         self._build_runs_tab()
         self._build_coatings_tab()
         self._build_export_tab()
         self._build_surrogate_tab()
+        self._build_targets_tab()
 
     # ── Вкладка «Материалы» ──────────────────────────────────────────────────
 
@@ -830,6 +833,149 @@ class DatabaseWindow(tk.Toplevel):
             f"Модель сохранена: {m['model_dir']}{warn}"
         )
 
+    # ── Вкладка «История целей» (Inverse Design) ─────────────────────────────
+
+    def _build_targets_tab(self) -> None:
+        frame = self._tab_targets
+        frame.columnconfigure(0, weight=0)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self._current_fig_target = None
+        self._mpl_canvas_target = None
+
+        # Левая колонка — список запросов
+        left = tk.Frame(frame, bg=BG, bd=1, relief="groove")
+        left.grid(row=0, column=0, sticky="ns", padx=(4, 6), pady=4)
+        left.rowconfigure(1, weight=1)
+
+        tk.Label(left, text="Запросы Inverse Design", bg=BG_DARK, fg=FG,
+                 font=FONT_B, anchor="w", padx=6, pady=3
+                 ).grid(row=0, column=0, sticky="ew")
+
+        cols = [("id", "ID", 40), ("created", "Создан", 130),
+                ("band", "Полоса (ГГц)", 110), ("rc", "RC цель", 60),
+                ("th", "Толщ. (мм)", 75), ("result", "Результат", 90)]
+        tree = ttk.Treeview(left, columns=[c[0] for c in cols], show="headings",
+                            height=22)
+        for cid, cname, cw in cols:
+            tree.heading(cid, text=cname)
+            tree.column(cid, width=cw, anchor="center", stretch=False)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=1, column=0, sticky="nsew", padx=(2, 0), pady=2)
+        vsb.grid(row=1, column=1, sticky="ns", pady=2)
+        tree.bind("<<TreeviewSelect>>", self._on_target_select)
+        self._tree_targets = tree
+
+        # Правая колонка — график найденного покрытия + детали цели
+        right = tk.Frame(frame, bg=BG, bd=2, relief="sunken")
+        right.grid(row=0, column=1, sticky="nsew", pady=4)
+        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=0)
+        right.columnconfigure(0, weight=1)
+
+        self._canvas_frame_target = tk.Frame(right, bg=BG)
+        self._canvas_frame_target.grid(row=0, column=0, sticky="nsew")
+        self._canvas_frame_target.rowconfigure(0, weight=1)
+        self._canvas_frame_target.columnconfigure(0, weight=1)
+
+        self._placeholder_target = tk.Label(
+            self._canvas_frame_target, text="← Выберите запрос в списке",
+            bg=BG, fg=FG_DIM, font=FONT)
+        self._placeholder_target.grid(row=0, column=0, sticky="nsew")
+
+        self._var_detail_target = tk.StringVar(value="")
+        tk.Label(right, textvariable=self._var_detail_target, bg=BG_DARK,
+                 fg=FG_DIM, font=FONT_SM, anchor="w", justify="left",
+                 padx=6, pady=3).grid(row=1, column=0, sticky="ew")
+
+    def _refresh_targets(self) -> None:
+        tree = self._tree_targets
+        for row in tree.get_children():
+            tree.delete(row)
+        for t in self._db.list_design_targets():
+            result_text = (f"#{t['resulting_coating_id']}"
+                          if t.get("resulting_coating_id") else "не найдено")
+            tree.insert("", "end", iid=str(t["target_id"]), values=(
+                t["target_id"], t["created_at"][:16],
+                f"{t['f_lo_hz']/1e9:.2f}–{t['f_hi_hz']/1e9:.2f}",
+                f"{t['rc_target_db']:+.1f}",
+                f"{t['max_thickness_mm']:.1f}" if t.get("max_thickness_mm") else "—",
+                result_text,
+            ))
+
+    def _on_target_select(self, event) -> None:
+        sel = self._tree_targets.selection()
+        if not sel:
+            return
+        target = self._db.get_design_target(int(sel[0]))
+        if target is None:
+            return
+        self._show_target(target)
+
+    def _show_target(self, target: dict) -> None:
+        if self._mpl_canvas_target is not None:
+            self._mpl_canvas_target.get_tk_widget().destroy()
+            self._mpl_canvas_target = None
+        if self._current_fig_target is not None:
+            plt.close(self._current_fig_target)
+            self._current_fig_target = None
+
+        band_str = f"{target['f_lo_hz']/1e9:.2f}–{target['f_hi_hz']/1e9:.2f} ГГц"
+        th_str = (f"{target['max_thickness_mm']:.1f} мм"
+                 if target.get("max_thickness_mm") else "не ограничена")
+
+        coating_id = target.get("resulting_coating_id")
+        if not coating_id:
+            self._placeholder_target.config(
+                text=f"Для этой цели ({band_str}, RC≤{target['rc_target_db']:+.1f} дБ) "
+                    f"подходящее покрытие не найдено.")
+            self._placeholder_target.grid()
+            self._var_detail_target.set(
+                f"Цель #{target['target_id']}: {band_str}, "
+                f"RC≤{target['rc_target_db']:+.1f} дБ, макс. толщина {th_str} — "
+                f"результата нет")
+            return
+
+        coating = self._db.get_coating(coating_id)
+        if coating is None:
+            self._placeholder_target.config(
+                text="Связанное покрытие было удалено из БД.")
+            self._placeholder_target.grid()
+            self._var_detail_target.set("")
+            return
+
+        try:
+            cfg, freqs, mat_arrays, names = build_plot_context(self._db, coating)
+        except ValueError as e:
+            self._placeholder_target.config(text=f"Не удалось построить график:\n{e}")
+            self._placeholder_target.grid()
+            self._var_detail_target.set("")
+            return
+
+        self._placeholder_target.grid_remove()
+        # График строится на полном измеренном диапазоне материалов (как
+        # сохранено в БД), а не только на целевой полосе — см. пояснение в
+        # detail-строке ниже: honest max_rc относится именно к целевой полосе.
+        fig = make_config_figure(cfg, freqs, mat_arrays, names,
+                                 rc_threshold=target["rc_target_db"])
+        self._current_fig_target = fig
+        canvas = FigureCanvasTkAgg(fig, master=self._canvas_frame_target)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._mpl_canvas_target = canvas
+
+        self._var_detail_target.set(
+            f"Цель #{target['target_id']}: полоса {band_str}, "
+            f"RC≤{target['rc_target_db']:+.1f} дБ, макс. толщина {th_str}  |  "
+            f"Покрытие #{coating_id} (прогон #{coating['run_id']}): "
+            f"max RC в целевой полосе = {coating['max_rc_db']:+.1f} дБ  |  "
+            f"Материалы: {', '.join(names)}  |  "
+            f"График показывает ПОЛНЫЙ измеренный диапазон материалов, "
+            f"не только целевую полосу."
+        )
+
     # ── Обновление всего окна ────────────────────────────────────────────────
 
     def refresh(self) -> None:
@@ -856,9 +1002,12 @@ class DatabaseWindow(tk.Toplevel):
         self._refresh_filter_options()
         self._refresh_coatings()
         self._refresh_export_runs()
+        self._refresh_targets()
 
     def _on_close(self) -> None:
         if self._current_fig is not None:
             plt.close(self._current_fig)
+        if self._current_fig_target is not None:
+            plt.close(self._current_fig_target)
         self._db.close()
         self.destroy()

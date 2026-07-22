@@ -91,16 +91,45 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             log.info(f"  {i:>3}  →  {fname}")
 
         material_names = [os.path.splitext(f)[0] for f in files]
-        mat_arrays     = build_mat_arrays(material_datas)
+        mat_arrays_full = build_mat_arrays(material_datas)
         num_materials  = len(material_datas)
 
-        f_center  = (float(np.min(freqs)) + float(np.max(freqs))) / 2.0
-        lambda_c  = c / f_center
-        h_max_abs = lambda_c * lambda_multiplier
-        log.info(f"Центральная частота: {f_center/1e9:.2f} ГГц  |  λ = {lambda_c*1000:.1f} мм")
+        # ── Inverse Design: поиск сфокусирован на целевой полосе частот ──────
+        # (пользователь сам выбирает материалы — как обычно — но задаёт полосу
+        # интереса и прямую макс. толщину вместо множителя λ по центру всего
+        # измеренного диапазона). Итоговая честная проверка ниже всегда
+        # использует ПОЛНУЮ сетку материалов — это не меняется.
+        inverse_design = bool(params.get('inverse_design', False))
+        target_mask = None
+        if inverse_design:
+            f_lo_hz = float(params['target_f_lo_ghz']) * 1e9
+            f_hi_hz = float(params['target_f_hi_ghz']) * 1e9
+            target_mask = (freqs >= f_lo_hz) & (freqs <= f_hi_hz)
+            if int(np.sum(target_mask)) < 2:
+                done_cb(False, f"Целевая полоса {f_lo_hz/1e9:.2f}–{f_hi_hz/1e9:.2f} ГГц "
+                        f"не пересекается (или почти не пересекается) с измеренным "
+                        f"диапазоном материалов "
+                        f"({freqs.min()/1e9:.2f}–{freqs.max()/1e9:.2f} ГГц).")
+                return
+            freqs_search = freqs[target_mask]
+            mat_arrays_search = {k: v[:, target_mask] for k, v in mat_arrays_full.items()}
+            h_max_abs = float(params['target_max_thickness_mm']) / 1000.0
+            log.info(f"Inverse Design: целевая полоса "
+                    f"{f_lo_hz/1e9:.2f}–{f_hi_hz/1e9:.2f} ГГц "
+                    f"({int(np.sum(target_mask))} точек из {len(freqs)}), "
+                    f"макс. толщина = {h_max_abs*1000:.1f} мм (задана напрямую)")
+        else:
+            freqs_search = freqs
+            mat_arrays_search = mat_arrays_full
+            f_center  = (float(np.min(freqs)) + float(np.max(freqs))) / 2.0
+            lambda_c  = c / f_center
+            h_max_abs = lambda_c * lambda_multiplier
+            log.info(f"Центральная частота: {f_center/1e9:.2f} ГГц  |  "
+                    f"λ = {lambda_c*1000:.1f} мм")
+            log.info(f"Множитель толщины: ×{lambda_multiplier:.3g}  →  "
+                    f"макс. суммарная толщина = {h_max_abs*1000:.1f} мм")
+
         log.info(f"Порог RC: {rc_threshold:+.1f} дБ")
-        log.info(f"Множитель толщины: ×{lambda_multiplier:.3g}  →  "
-                 f"макс. суммарная толщина = {h_max_abs*1000:.1f} мм")
 
         w_map   = {'1': (1.0, 0.0), '2': (0.1, 0.9), '3': (1.0, 0.3)}
         w_rc, w_th = w_map.get(mode, (1.0, 0.3))
@@ -150,7 +179,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             t_layer = __import__('time').time()
             try:
                 candidates = nsga2_optimise(
-                    n_layers, num_materials, freqs, mat_arrays,
+                    n_layers, num_materials, freqs_search, mat_arrays_search,
                     h_max_total=h_max_abs, w_rc=w_rc, w_th=w_th,
                     rc_threshold=rc_threshold,
                     rc_evaluator=rc_evaluator,
@@ -171,9 +200,16 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 continue
 
             for seq, hs, rc, th in candidates:
-                RC_arr = tmm_reflection(freqs, seq, hs, mat_arrays)
-                max_rc = float(np.max(RC_arr))          # источник истины — честный пересчёт
-                bw     = compute_bandwidth(RC_arr, freqs, threshold=rc_threshold)
+                # Честный пересчёт ВСЕГДА на полной измеренной сетке материалов —
+                # это то, что сохраняется в БД и показывается в графиках,
+                # независимо от того, был ли поиск сфокусирован на подполосе.
+                RC_arr_full = tmm_reflection(freqs, seq, hs, mat_arrays_full)
+                if inverse_design:
+                    eval_curve, eval_freqs = RC_arr_full[target_mask], freqs[target_mask]
+                else:
+                    eval_curve, eval_freqs = RC_arr_full, freqs
+                max_rc = float(np.max(eval_curve))      # источник истины — честный пересчёт
+                bw     = compute_bandwidth(eval_curve, eval_freqs, threshold=rc_threshold)
                 if abs(rc - max_rc) > 0.05:
                     log.warning(
                         f"  Расхождение RC оптимизатора ({rc:+.2f} дБ) и честного "
@@ -181,7 +217,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                         f"hs={tuple(round(h*1000,3) for h in hs)} мм — "
                         f"использую пересчёт.")
                 try:
-                    sens = sensitivity_analysis(seq, hs, freqs, mat_arrays)
+                    sens = sensitivity_analysis(seq, hs, freqs_search, mat_arrays_search)
                 except Exception:
                     sens = {}
                 all_configs.append({
@@ -215,13 +251,36 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 saved_ids = db.add_coatings(
                     run_id, all_configs, material_ids,
                     rc_threshold=rc_threshold,
-                    freqs=freqs, mat_arrays=mat_arrays,
+                    freqs=freqs, mat_arrays=mat_arrays_full,
                     only_valid=params.get('save_only_valid_to_db', True),
                     save_curves=params.get('save_curves_to_db', True),
                 )
-                db.close()
                 log.info(f"БД: run_id={run_id}, сохранено {len(saved_ids)} "
                          f"покрытий ({db.db_path})")
+
+                if inverse_design:
+                    best_coating_id = None
+                    rank1 = [c for c in db.list_coatings(run_id=run_id)
+                            if c.get('rank') == 1]
+                    if rank1:
+                        best_coating_id = rank1[0]['coating_id']
+                    target_id = db.create_design_target(
+                        f_lo_hz=float(params['target_f_lo_ghz']) * 1e9,
+                        f_hi_hz=float(params['target_f_hi_ghz']) * 1e9,
+                        rc_target_db=rc_threshold,
+                        max_thickness_mm=float(params['target_max_thickness_mm']),
+                        allowed_material_ids=material_ids,
+                        comment=f"run_id={run_id}",
+                    )
+                    db.set_design_target_result(target_id, best_coating_id)
+                    if best_coating_id:
+                        log.info(f"Inverse Design: цель target_id={target_id} → "
+                                f"лучшее покрытие coating_id={best_coating_id}")
+                    else:
+                        log.warning(f"Inverse Design: цель target_id={target_id} — "
+                                   f"подходящего покрытия не найдено.")
+
+                db.close()
             except Exception as exc:
                 log.warning(f"Не удалось сохранить результаты в БД: {exc}")
 
@@ -244,7 +303,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             tag = (f"rank{cfg.get('rank', '?')}_{cfg['n_layers']}L_"
                    f"rc{cfg['max_rc']:+.1f}dB_{cfg['total_mm']:.1f}mm"
                    ).replace('+', 'p').replace('-', 'm')
-            plot_rc_for_config(cfg, freqs, mat_arrays, material_names,
+            plot_rc_for_config(cfg, freqs, mat_arrays_full, material_names,
                                filename=os.path.join(output_dir, f"config_{tag}.png"),
                                rc_threshold=rc_threshold)
 
@@ -270,7 +329,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         log.info("Готово.")
 
         # ── Передать результаты для окна предпросмотра ────────────────────────
-        result_cb(pool, freqs, mat_arrays, material_names, rc_threshold)
+        result_cb(pool, freqs, mat_arrays_full, material_names, rc_threshold)
         done_cb(True, summary)
 
     except Exception as exc:

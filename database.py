@@ -309,80 +309,6 @@ class Database:
             "FROM optimisation_runs ORDER BY run_id DESC")
         return [dict(r) for r in cur.fetchall()]
 
-    def update_run_comment(self, run_id: int, comment: str) -> None:
-        """Обновить (или очистить) комментарий к прогону."""
-        self._conn.execute(
-            "UPDATE optimisation_runs SET comment = ? WHERE run_id = ?",
-            (comment, run_id))
-        self._conn.commit()
-
-    def delete_run(self, run_id: int, delete_orphan_materials: bool = True) -> dict:
-        """
-        Удалить прогон и всё, что к нему привязано.
-
-        Покрытия (coatings) удаляются автоматически через
-        ON DELETE CASCADE (FK coatings.run_id → optimisation_runs.run_id).
-
-        Материалы (materials) НЕ имеют FK-связи с прогоном напрямую — один
-        и тот же материал (после дедупликации) может использоваться в
-        нескольких прогонах, поэтому удалять его вслепую нельзя. Вместо
-        этого, если delete_orphan_materials=True (по умолчанию), после
-        удаления прогона проверяется, остался ли материал упомянут хоть
-        в одном ОСТАВШЕМСЯ прогоне (optimisation_runs.material_ids) или
-        покрытии (coatings.sequence_material_ids) — и если нет, материал
-        удаляется как осиротевший.
-
-        Возвращает {"run_id", "coatings_deleted", "materials_deleted"}.
-        Бросает ValueError, если прогон с таким run_id не найден.
-        """
-        run = self.get_run(run_id)
-        if run is None:
-            raise ValueError(f"Прогон run_id={run_id} не найден.")
-
-        # PRAGMA foreign_keys включается на соединение — на всякий случай
-        # переустанавливаем перед удалением, чтобы каскад точно сработал.
-        self._conn.execute("PRAGMA foreign_keys = ON;")
-
-        candidate_material_ids = set(run["material_ids"])
-
-        cur = self._conn.execute(
-            "SELECT COUNT(*) FROM coatings WHERE run_id = ?", (run_id,))
-        coatings_deleted = cur.fetchone()[0]
-
-        self._conn.execute(
-            "DELETE FROM optimisation_runs WHERE run_id = ?", (run_id,))
-        self._conn.commit()
-
-        materials_deleted = 0
-        if delete_orphan_materials and candidate_material_ids:
-            remaining_run_rows = self._conn.execute(
-                "SELECT material_ids FROM optimisation_runs").fetchall()
-            used_in_runs = set()
-            for r in remaining_run_rows:
-                used_in_runs.update(json.loads(r["material_ids"]))
-
-            remaining_coating_rows = self._conn.execute(
-                "SELECT sequence_material_ids FROM coatings").fetchall()
-            used_in_coatings = set()
-            for r in remaining_coating_rows:
-                used_in_coatings.update(json.loads(r["sequence_material_ids"]))
-
-            still_used_ids = used_in_runs | used_in_coatings
-            orphan_ids = [mid for mid in candidate_material_ids
-                         if mid not in still_used_ids]
-
-            for mid in orphan_ids:
-                self._conn.execute(
-                    "DELETE FROM materials WHERE material_id = ?", (mid,))
-                materials_deleted += 1
-            self._conn.commit()
-
-        log.info(f"  БД: удалён прогон run_id={run_id} "
-                 f"(покрытий: {coatings_deleted}, "
-                 f"осиротевших материалов: {materials_deleted})")
-        return {"run_id": run_id, "coatings_deleted": coatings_deleted,
-                "materials_deleted": materials_deleted}
-
     # ─────────────────────────────────────────────────────────────────────
     # Покрытия
     # ─────────────────────────────────────────────────────────────────────
@@ -523,6 +449,79 @@ class Database:
     # ─────────────────────────────────────────────────────────────────────
     # Сводная статистика (для отображения в GUI)
     # ─────────────────────────────────────────────────────────────────────
+
+    def update_coating_metrics(self, coating_id: int, max_rc_db: float,
+                               bandwidth_ghz: float | None,
+                               is_valid: int, rank: int | None,
+                               score: float | None) -> None:
+        """
+        Обновить пересчитанные метрики покрытия (используется скриптом
+        recompute_db.py для исправления исторических записей после фикса
+        бага рассинхронизации max_rc — см. recompute_db.py).
+        """
+        self._conn.execute("""
+            UPDATE coatings
+            SET max_rc_db = ?, bandwidth_ghz = ?, is_valid = ?, rank = ?, score = ?
+            WHERE coating_id = ?
+        """, (max_rc_db, bandwidth_ghz, is_valid, rank, score, coating_id))
+        self._conn.commit()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Inverse Design — лог запросов "цель → результат"
+    # ─────────────────────────────────────────────────────────────────────
+
+    def create_design_target(self, f_lo_hz: float, f_hi_hz: float,
+                             rc_target_db: float,
+                             max_thickness_mm: float | None = None,
+                             allowed_material_ids: list | None = None,
+                             comment: str = "") -> int:
+        """
+        Зафиксировать запрос Inverse Design ("нужна полоса такая-то с таким-то
+        порогом RC из вот этих материалов"). Не завязан на конкретный run_id —
+        один запрос может привести к нескольким прогонам/попыткам.
+        """
+        cur = self._conn.execute("""
+            INSERT INTO design_targets
+                (created_at, f_lo_hz, f_hi_hz, rc_target_db, max_thickness_mm,
+                 allowed_material_ids, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _now_iso(), f_lo_hz, f_hi_hz, rc_target_db, max_thickness_mm,
+            json.dumps(allowed_material_ids) if allowed_material_ids else None,
+            comment,
+        ))
+        self._conn.commit()
+        target_id = cur.lastrowid
+        log.info(f"  БД: зафиксирована цель Inverse Design target_id={target_id} "
+                f"({f_lo_hz/1e9:.2f}-{f_hi_hz/1e9:.2f} ГГц, RC≤{rc_target_db:+.1f} дБ)")
+        return target_id
+
+    def set_design_target_result(self, target_id: int, coating_id: int | None) -> None:
+        """Привязать результат (лучшее найденное покрытие) к запросу цели."""
+        self._conn.execute(
+            "UPDATE design_targets SET resulting_coating_id = ? WHERE target_id = ?",
+            (coating_id, target_id))
+        self._conn.commit()
+
+    def get_design_target(self, target_id: int) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM design_targets WHERE target_id = ?", (target_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["allowed_material_ids"] = (json.loads(d["allowed_material_ids"])
+                                     if d["allowed_material_ids"] else None)
+        return d
+
+    def list_design_targets(self) -> list:
+        cur = self._conn.execute(
+            "SELECT * FROM design_targets ORDER BY target_id DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["allowed_material_ids"] = (json.loads(r["allowed_material_ids"])
+                                        if r["allowed_material_ids"] else None)
+        return rows
 
     def stats(self) -> dict:
         cur = self._conn.cursor()
