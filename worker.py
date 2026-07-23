@@ -19,6 +19,7 @@ from physics import (
     tmm_reflection, write_csv, RC_THRESHOLD,
     H_MIN, LAMBDA_MULTIPLIER_DEFAULT,
     validate_rc_threshold, validate_lambda_multiplier,
+    _mat_arrays_counter,
 )
 from plotting import plot_rc_for_config, plot_pareto_front
 from database import Database
@@ -112,7 +113,9 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                         f"({freqs.min()/1e9:.2f}–{freqs.max()/1e9:.2f} ГГц).")
                 return
             freqs_search = freqs[target_mask]
-            mat_arrays_search = {k: v[:, target_mask] for k, v in mat_arrays_full.items()}
+            mat_arrays_search = {k: v[:, target_mask] for k, v in mat_arrays_full.items()
+                                 if k != '_cache_id'}
+            mat_arrays_search['_cache_id'] = next(_mat_arrays_counter)
             h_max_abs = float(params['target_max_thickness_mm']) / 1000.0
             log.info(f"Inverse Design: целевая полоса "
                     f"{f_lo_hz/1e9:.2f}–{f_hi_hz/1e9:.2f} ГГц "
@@ -140,6 +143,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         # ниже честно пересчитываются через tmm_reflection перед сохранением —
         # это не меняется независимо от выбора здесь (см. блок all_configs.append).
         rc_evaluator = None  # None → nsga2_optimise использует честный TMM
+        surrogate_model = None
         calc_method = params.get('calc_method', 'tmm')
         if calc_method == 'surrogate':
             model_dir = params.get('surrogate_model_dir', '')
@@ -150,12 +154,50 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 log.info(f"Метод расчёта при поиске: СУРРОГАТ-МОДЕЛЬ "
                         f"({model_dir}). Итоговые результаты будут перепроверены "
                         f"честным TMM перед сохранением.")
+
+                # ── Проверка совпадения диапазона модели с диапазоном поиска ──
+                # np.interp в build_rc_evaluator молча экстраполирует константой
+                # за пределами обучающего диапазона модели — без этой проверки
+                # несовпадение модели/цели осталось бы незамеченным.
+                model_lo, model_hi = surrogate_model.canon_freq_hz[0], surrogate_model.canon_freq_hz[-1]
+                search_lo, search_hi = float(np.min(freqs_search)), float(np.max(freqs_search))
+                overlap_lo, overlap_hi = max(model_lo, search_lo), min(model_hi, search_hi)
+                overlap = max(0.0, overlap_hi - overlap_lo)
+                search_span = search_hi - search_lo
+                overlap_frac = overlap / search_span if search_span > 0 else 0.0
+                if overlap_frac < 0.95:
+                    log.warning(
+                        f"⚠ Суррогат-модель обучена на "
+                        f"{model_lo/1e9:.2f}-{model_hi/1e9:.2f} ГГц, а поиск "
+                        f"ведётся на {search_lo/1e9:.2f}-{search_hi/1e9:.2f} ГГц — "
+                        f"пересечение только {overlap_frac*100:.0f}%. Вне "
+                        f"обучающего диапазона модель экстраполирует константой, "
+                        f"её предсказания там недостоверны. Итоговый результат "
+                        f"всё равно будет честно проверен TMM, но поиск может "
+                        f"быть неэффективен. Загрузите модель, обученную на "
+                        f"этот диапазон частот, или используйте честный TMM.")
             except Exception as exc:
                 log.warning(f"Не удалось загрузить суррогат-модель ({exc}) — "
                            f"использую честный TMM для поиска.")
                 rc_evaluator = None
+                surrogate_model = None
         if rc_evaluator is None:
             log.info("Метод расчёта при поиске: честный TMM.")
+
+        # ── Seed-proposer: включается автоматически, когда одновременно ──────
+        # активны суррогат И Inverse Design (нужна и модель, и чётко заданная
+        # цель — полоса/порог/толщина — чтобы было что ранжировать). См.
+        # seed_proposer.py. При отсутствии суррогата или вне Inverse Design
+        # поведение НЕ меняется — обычный честный nsga2_optimise() ниже.
+        use_seed_proposer = inverse_design and surrogate_model is not None
+        if use_seed_proposer:
+            import seed_proposer
+            _sp_top_k = int(params.get('seed_proposer_top_k', 15))
+            _sp_n_trials = int(params.get('seed_proposer_n_trials', 8))
+            log.info(f"Seed-proposer АКТИВЕН (top_k={_sp_top_k}, "
+                    f"n_trials={_sp_n_trials}): последовательности материалов "
+                    f"будут предварительно отранжированы суррогатом, честный "
+                    f"DE+TMM запустится только для лучших кандидатов.")
 
         # Суммарное число поколений с адаптивной формулой
         total_gens = sum(max(30, 80 - n * 5) for n in range(1, N_max_layers + 1))
@@ -178,14 +220,29 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
 
             t_layer = __import__('time').time()
             try:
-                candidates = nsga2_optimise(
-                    n_layers, num_materials, freqs_search, mat_arrays_search,
-                    h_max_total=h_max_abs, w_rc=w_rc, w_th=w_th,
-                    rc_threshold=rc_threshold,
-                    rc_evaluator=rc_evaluator,
-                    _cancel_flag=cancel_flag,
-                    _progress_cb=_progress,
-                )
+                if use_seed_proposer:
+                    candidates = seed_proposer.propose_and_verify(
+                        n_layers, num_materials, freqs_search, mat_arrays_search,
+                        material_datas, h_max_total=h_max_abs,
+                        rc_threshold=rc_threshold,
+                        surrogate_model=surrogate_model,
+                        rc_evaluator=rc_evaluator,
+                        top_k=int(params.get('seed_proposer_top_k', 15)),
+                        n_trials_per_sequence=int(
+                            params.get('seed_proposer_n_trials', 8)),
+                        w_rc=w_rc, w_th=w_th,
+                        _cancel_flag=cancel_flag,
+                    )
+                    _progress()  # у seed-proposer нет честного счётчика поколений
+                else:
+                    candidates = nsga2_optimise(
+                        n_layers, num_materials, freqs_search, mat_arrays_search,
+                        h_max_total=h_max_abs, w_rc=w_rc, w_th=w_th,
+                        rc_threshold=rc_threshold,
+                        rc_evaluator=rc_evaluator,
+                        _cancel_flag=cancel_flag,
+                        _progress_cb=_progress,
+                    )
             except Exception as exc:
                 log.error(f"  NSGA-II n={n_layers} завершился с ошибкой: {exc}")
                 continue

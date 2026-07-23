@@ -348,6 +348,38 @@ class App:
                      "только повлиять на скорость и качество поиска."
                 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        # ── Seed-proposer: активируется автоматически при Inverse Design ────
+        ttk.Separator(tab_surrogate, orient="horizontal"
+                     ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 6))
+
+        tk.Label(tab_surrogate, bg=BG, fg=FG, font=("Tahoma", 9, "bold"),
+                anchor="w", text="Seed-proposer (только с Inverse Design):"
+                ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        tk.Label(tab_surrogate, bg=BG, fg=FG, anchor="w",
+                text="Top-K последовательностей на честный DE:"
+                ).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self._var_seed_top_k = tk.IntVar(value=15)
+        ttk.Spinbox(tab_surrogate, from_=1, to=200, increment=1,
+                   textvariable=self._var_seed_top_k, width=6
+                   ).grid(row=5, column=1, sticky="w", pady=(4, 0))
+
+        tk.Label(tab_surrogate, bg=BG, fg=FG, anchor="w",
+                text="Пробных толщин на последовательность:"
+                ).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        self._var_seed_n_trials = tk.IntVar(value=8)
+        ttk.Spinbox(tab_surrogate, from_=1, to=100, increment=1,
+                   textvariable=self._var_seed_n_trials, width=6
+                   ).grid(row=6, column=1, sticky="w", pady=(2, 0))
+
+        tk.Label(tab_surrogate, bg=BG, fg="#666666", font=("Tahoma", 8),
+                justify="left", anchor="w", wraplength=280,
+                text="Больше Top-K и пробных толщин — точнее ранжирование, "
+                     "но медленнее (больше вызовов честного DE и суррогата). "
+                     "Меньше — быстрее, но выше риск пропустить хорошую "
+                     "последовательность из-за грубой оценки суррогата."
+                ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         # ── Сохранение в базу данных ─────────────────────────────────────────
         grp_db = groupbox(left, "База данных", row=5, col=0, sticky="ew")
         self._var_save_to_db       = tk.BooleanVar(value=True)
@@ -571,6 +603,15 @@ class App:
             except ValueError as e:
                 messagebox.showerror("Ошибка", str(e))
                 return
+            try:
+                if self._var_seed_top_k.get() < 1 or self._var_seed_n_trials.get() < 1:
+                    raise ValueError
+            except (ValueError, tk.TclError):
+                messagebox.showerror(
+                    "Ошибка",
+                    "Параметры seed-proposer (Top-K, пробные толщины) должны "
+                    "быть положительными целыми числами.")
+                return
 
         worker.cancel_flag.clear()
         self._last_results = None
@@ -600,6 +641,8 @@ class App:
             'target_f_lo_ghz':     target_f_lo,
             'target_f_hi_ghz':     target_f_hi,
             'target_max_thickness_mm': target_max_mm,
+            'seed_proposer_top_k':    self._var_seed_top_k.get(),
+            'seed_proposer_n_trials': self._var_seed_n_trials.get(),
         }
 
         def progress_cb(done, total):

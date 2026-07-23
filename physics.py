@@ -135,7 +135,7 @@ def tmm_reflection(freqs: np.ndarray,
 
     for l in range(len(sequence)):
         mi  = sequence[l] - 1
-        key = (id(mat_arrays), mi, hs[l])
+        key = (mat_arrays['_cache_id'], mi, hs[l])
         if key in _trig_cache:
             cos_, sin_, nu = _trig_cache[key]
         else:
@@ -160,6 +160,10 @@ def tmm_reflection(freqs: np.ndarray,
     return result
 
 
+import itertools as _itertools
+_mat_arrays_counter = _itertools.count()
+
+
 def build_mat_arrays(material_datas: list) -> dict:
     """
     Предвычислить γ и ν для всех материалов и всех частот.
@@ -167,6 +171,16 @@ def build_mat_arrays(material_datas: list) -> dict:
     Возвращает словарь с ключами:
         'er', 'eim', 'mr', 'mim'   — форма (n_mat, n_freq)
         'gamma', 'nu'              — форма (n_mat, n_freq)
+        '_cache_id'                — уникальный монотонный штамп для ключей
+                                     кеша (_trig_cache/_fitness_cache) вместо
+                                     id(mat_arrays). id() python-объекта не
+                                     годится: после сборки мусора он может
+                                     быть переиспользован для другого,
+                                     физически иного mat_arrays — тогда кеш
+                                     возвращал бы значения ЧУЖОГО материала.
+                                     Актуально для коротко живущих mat_arrays
+                                     (например, db_viewer.py строит новый
+                                     mat_arrays на каждый выбранный график).
     """
     n_mat  = len(material_datas)
     n_freq = len(material_datas[0]['freq'])
@@ -181,6 +195,7 @@ def build_mat_arrays(material_datas: list) -> dict:
     mu_c     = arrs['mr']  - 1j * arrs['mim']                     # (n_mat, n_freq)
     arrs['gamma'] = k0[None, :] * np.sqrt(mu_c * eps_c)           # (n_mat, n_freq)
     arrs['nu']    = Z0          * np.sqrt(mu_c / eps_c)            # (n_mat, n_freq)
+    arrs['_cache_id'] = next(_mat_arrays_counter)
     return arrs
 
 
@@ -213,7 +228,7 @@ def evaluate_objectives(sequence: tuple, hs,
     if rc_evaluator is None:
         rc_evaluator = tmm_reflection
     hs_q = quantise(hs)
-    key  = (id(mat_arrays), id(rc_evaluator), sequence, hs_q)
+    key  = (mat_arrays['_cache_id'], id(rc_evaluator), sequence, hs_q)
     if key in _fitness_cache:
         return _fitness_cache[key]
     RC     = rc_evaluator(freqs, sequence, hs_q, mat_arrays)
