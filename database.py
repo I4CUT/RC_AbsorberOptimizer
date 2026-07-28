@@ -523,6 +523,25 @@ class Database:
                                         if r["allowed_material_ids"] else None)
         return rows
 
+    def set_material_aliases_text(self, material_id: int, aliases_text: str) -> None:
+        """
+        Установить «Другие имена» материала из свободного текста, введённого
+        пользователем в окне БД (через запятую — несколько записей).
+        Полностью заменяет прежний список aliases (а не дописывает к нему).
+        """
+        aliases = [a.strip() for a in aliases_text.split(",") if a.strip()]
+        self._conn.execute(
+            "UPDATE materials SET aliases = ? WHERE material_id = ?",
+            (json.dumps(aliases, ensure_ascii=False), material_id))
+        self._conn.commit()
+
+    def set_run_comment(self, run_id: int, comment: str) -> None:
+        """Установить комментарий прогона (редактируется в окне БД)."""
+        self._conn.execute(
+            "UPDATE optimisation_runs SET comment = ? WHERE run_id = ?",
+            (comment, run_id))
+        self._conn.commit()
+
     def stats(self) -> dict:
         cur = self._conn.cursor()
         n_materials = cur.execute("SELECT COUNT(*) FROM materials").fetchone()[0]
