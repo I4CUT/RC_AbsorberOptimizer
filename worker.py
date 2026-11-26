@@ -19,8 +19,13 @@ from physics import (
     tmm_reflection, write_csv, RC_THRESHOLD,
     H_MIN, LAMBDA_MULTIPLIER_DEFAULT,
     validate_rc_threshold, validate_lambda_multiplier,
+    effective_layer_count,
+    _mat_arrays_counter,
 )
-from plotting import plot_rc_for_config, plot_pareto_front
+from plotting import (
+    plot_rc_for_config, plot_pareto_front,
+    save_config_spectrum_xlsx, save_pareto_front_xlsx,
+)
 from database import Database
 
 log = logging.getLogger("rc_opt")
@@ -91,16 +96,47 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             log.info(f"  {i:>3}  →  {fname}")
 
         material_names = [os.path.splitext(f)[0] for f in files]
-        mat_arrays     = build_mat_arrays(material_datas)
+        mat_arrays_full = build_mat_arrays(material_datas)
         num_materials  = len(material_datas)
 
-        f_center  = (float(np.min(freqs)) + float(np.max(freqs))) / 2.0
-        lambda_c  = c / f_center
-        h_max_abs = lambda_c * lambda_multiplier
-        log.info(f"Центральная частота: {f_center/1e9:.2f} ГГц  |  λ = {lambda_c*1000:.1f} мм")
+        # ── Inverse Design: поиск сфокусирован на целевой полосе частот ──────
+        # (пользователь сам выбирает материалы — как обычно — но задаёт полосу
+        # интереса и прямую макс. толщину вместо множителя λ по центру всего
+        # измеренного диапазона). Итоговая честная проверка ниже всегда
+        # использует ПОЛНУЮ сетку материалов — это не меняется.
+        inverse_design = bool(params.get('inverse_design', False))
+        target_mask = None
+        if inverse_design:
+            f_lo_hz = float(params['target_f_lo_ghz']) * 1e9
+            f_hi_hz = float(params['target_f_hi_ghz']) * 1e9
+            target_mask = (freqs >= f_lo_hz) & (freqs <= f_hi_hz)
+            if int(np.sum(target_mask)) < 2:
+                done_cb(False, f"Целевая полоса {f_lo_hz/1e9:.2f}–{f_hi_hz/1e9:.2f} ГГц "
+                        f"не пересекается (или почти не пересекается) с измеренным "
+                        f"диапазоном материалов "
+                        f"({freqs.min()/1e9:.2f}–{freqs.max()/1e9:.2f} ГГц).")
+                return
+            freqs_search = freqs[target_mask]
+            mat_arrays_search = {k: v[:, target_mask] for k, v in mat_arrays_full.items()
+                                 if k != '_cache_id'}
+            mat_arrays_search['_cache_id'] = next(_mat_arrays_counter)
+            h_max_abs = float(params['target_max_thickness_mm']) / 1000.0
+            log.info(f"Inverse Design: целевая полоса "
+                    f"{f_lo_hz/1e9:.2f}–{f_hi_hz/1e9:.2f} ГГц "
+                    f"({int(np.sum(target_mask))} точек из {len(freqs)}), "
+                    f"макс. толщина = {h_max_abs*1000:.1f} мм (задана напрямую)")
+        else:
+            freqs_search = freqs
+            mat_arrays_search = mat_arrays_full
+            f_center  = (float(np.min(freqs)) + float(np.max(freqs))) / 2.0
+            lambda_c  = c / f_center
+            h_max_abs = lambda_c * lambda_multiplier
+            log.info(f"Центральная частота: {f_center/1e9:.2f} ГГц  |  "
+                    f"λ = {lambda_c*1000:.1f} мм")
+            log.info(f"Множитель толщины: ×{lambda_multiplier:.3g}  →  "
+                    f"макс. суммарная толщина = {h_max_abs*1000:.1f} мм")
+
         log.info(f"Порог RC: {rc_threshold:+.1f} дБ")
-        log.info(f"Множитель толщины: ×{lambda_multiplier:.3g}  →  "
-                 f"макс. суммарная толщина = {h_max_abs*1000:.1f} мм")
 
         w_map   = {'1': (1.0, 0.0), '2': (0.1, 0.9), '3': (1.0, 0.3)}
         w_rc, w_th = w_map.get(mode, (1.0, 0.3))
@@ -111,6 +147,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         # ниже честно пересчитываются через tmm_reflection перед сохранением —
         # это не меняется независимо от выбора здесь (см. блок all_configs.append).
         rc_evaluator = None  # None → nsga2_optimise использует честный TMM
+        surrogate_model = None
         calc_method = params.get('calc_method', 'tmm')
         if calc_method == 'surrogate':
             model_dir = params.get('surrogate_model_dir', '')
@@ -121,12 +158,50 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 log.info(f"Метод расчёта при поиске: СУРРОГАТ-МОДЕЛЬ "
                         f"({model_dir}). Итоговые результаты будут перепроверены "
                         f"честным TMM перед сохранением.")
+
+                # ── Проверка совпадения диапазона модели с диапазоном поиска ──
+                # np.interp в build_rc_evaluator молча экстраполирует константой
+                # за пределами обучающего диапазона модели — без этой проверки
+                # несовпадение модели/цели осталось бы незамеченным.
+                model_lo, model_hi = surrogate_model.canon_freq_hz[0], surrogate_model.canon_freq_hz[-1]
+                search_lo, search_hi = float(np.min(freqs_search)), float(np.max(freqs_search))
+                overlap_lo, overlap_hi = max(model_lo, search_lo), min(model_hi, search_hi)
+                overlap = max(0.0, overlap_hi - overlap_lo)
+                search_span = search_hi - search_lo
+                overlap_frac = overlap / search_span if search_span > 0 else 0.0
+                if overlap_frac < 0.95:
+                    log.warning(
+                        f"⚠ Суррогат-модель обучена на "
+                        f"{model_lo/1e9:.2f}-{model_hi/1e9:.2f} ГГц, а поиск "
+                        f"ведётся на {search_lo/1e9:.2f}-{search_hi/1e9:.2f} ГГц — "
+                        f"пересечение только {overlap_frac*100:.0f}%. Вне "
+                        f"обучающего диапазона модель экстраполирует константой, "
+                        f"её предсказания там недостоверны. Итоговый результат "
+                        f"всё равно будет честно проверен TMM, но поиск может "
+                        f"быть неэффективен. Загрузите модель, обученную на "
+                        f"этот диапазон частот, или используйте честный TMM.")
             except Exception as exc:
                 log.warning(f"Не удалось загрузить суррогат-модель ({exc}) — "
                            f"использую честный TMM для поиска.")
                 rc_evaluator = None
+                surrogate_model = None
         if rc_evaluator is None:
             log.info("Метод расчёта при поиске: честный TMM.")
+
+        # ── Seed-proposer: включается автоматически, когда одновременно ──────
+        # активны суррогат И Inverse Design (нужна и модель, и чётко заданная
+        # цель — полоса/порог/толщина — чтобы было что ранжировать). См.
+        # seed_proposer.py. При отсутствии суррогата или вне Inverse Design
+        # поведение НЕ меняется — обычный честный nsga2_optimise() ниже.
+        use_seed_proposer = inverse_design and surrogate_model is not None
+        if use_seed_proposer:
+            import seed_proposer
+            _sp_top_k = int(params.get('seed_proposer_top_k', 15))
+            _sp_n_trials = int(params.get('seed_proposer_n_trials', 8))
+            log.info(f"Seed-proposer АКТИВЕН (top_k={_sp_top_k}, "
+                    f"n_trials={_sp_n_trials}): последовательности материалов "
+                    f"будут предварительно отранжированы суррогатом, честный "
+                    f"DE+TMM запустится только для лучших кандидатов.")
 
         # Суммарное число поколений с адаптивной формулой
         total_gens = sum(max(30, 80 - n * 5) for n in range(1, N_max_layers + 1))
@@ -149,14 +224,29 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
 
             t_layer = __import__('time').time()
             try:
-                candidates = nsga2_optimise(
-                    n_layers, num_materials, freqs, mat_arrays,
-                    h_max_total=h_max_abs, w_rc=w_rc, w_th=w_th,
-                    rc_threshold=rc_threshold,
-                    rc_evaluator=rc_evaluator,
-                    _cancel_flag=cancel_flag,
-                    _progress_cb=_progress,
-                )
+                if use_seed_proposer:
+                    candidates = seed_proposer.propose_and_verify(
+                        n_layers, num_materials, freqs_search, mat_arrays_search,
+                        material_datas, h_max_total=h_max_abs,
+                        rc_threshold=rc_threshold,
+                        surrogate_model=surrogate_model,
+                        rc_evaluator=rc_evaluator,
+                        top_k=int(params.get('seed_proposer_top_k', 15)),
+                        n_trials_per_sequence=int(
+                            params.get('seed_proposer_n_trials', 8)),
+                        w_rc=w_rc, w_th=w_th,
+                        _cancel_flag=cancel_flag,
+                    )
+                    _progress()  # у seed-proposer нет честного счётчика поколений
+                else:
+                    candidates = nsga2_optimise(
+                        n_layers, num_materials, freqs_search, mat_arrays_search,
+                        h_max_total=h_max_abs, w_rc=w_rc, w_th=w_th,
+                        rc_threshold=rc_threshold,
+                        rc_evaluator=rc_evaluator,
+                        _cancel_flag=cancel_flag,
+                        _progress_cb=_progress,
+                    )
             except Exception as exc:
                 log.error(f"  NSGA-II n={n_layers} завершился с ошибкой: {exc}")
                 continue
@@ -171,9 +261,16 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 continue
 
             for seq, hs, rc, th in candidates:
-                RC_arr = tmm_reflection(freqs, seq, hs, mat_arrays)
-                max_rc = float(np.max(RC_arr))          # источник истины — честный пересчёт
-                bw     = compute_bandwidth(RC_arr, freqs, threshold=rc_threshold)
+                # Честный пересчёт ВСЕГДА на полной измеренной сетке материалов —
+                # это то, что сохраняется в БД и показывается в графиках,
+                # независимо от того, был ли поиск сфокусирован на подполосе.
+                RC_arr_full = tmm_reflection(freqs, seq, hs, mat_arrays_full)
+                if inverse_design:
+                    eval_curve, eval_freqs = RC_arr_full[target_mask], freqs[target_mask]
+                else:
+                    eval_curve, eval_freqs = RC_arr_full, freqs
+                max_rc = float(np.max(eval_curve))      # источник истины — честный пересчёт
+                bw     = compute_bandwidth(eval_curve, eval_freqs, threshold=rc_threshold)
                 if abs(rc - max_rc) > 0.05:
                     log.warning(
                         f"  Расхождение RC оптимизатора ({rc:+.2f} дБ) и честного "
@@ -181,11 +278,19 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                         f"hs={tuple(round(h*1000,3) for h in hs)} мм — "
                         f"использую пересчёт.")
                 try:
-                    sens = sensitivity_analysis(seq, hs, freqs, mat_arrays)
+                    sens = sensitivity_analysis(seq, hs, freqs_search, mat_arrays_search)
                 except Exception:
                     sens = {}
+                eff_n = effective_layer_count(seq)
+                if eff_n != n_layers:
+                    log.warning(
+                        f"  seq={seq}: заявлено {n_layers} слоёв, но физически "
+                        f"различимых только {eff_n} (соседние слои одного "
+                        f"материала эквивалентны в TMM одному более толстому "
+                        f"слою). Используйте 'n_layers_effective' в отчётах.")
                 all_configs.append({
-                    'n_layers': n_layers, 'sequence': seq, 'hs': hs,
+                    'n_layers': n_layers, 'n_layers_effective': eff_n,
+                    'sequence': seq, 'hs': hs,
                     'max_rc': max_rc, 'total_mm': th,
                     'bandwidth_ghz': bw, 'sensitivity': sens,
                 })
@@ -215,13 +320,36 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                 saved_ids = db.add_coatings(
                     run_id, all_configs, material_ids,
                     rc_threshold=rc_threshold,
-                    freqs=freqs, mat_arrays=mat_arrays,
+                    freqs=freqs, mat_arrays=mat_arrays_full,
                     only_valid=params.get('save_only_valid_to_db', True),
                     save_curves=params.get('save_curves_to_db', True),
                 )
-                db.close()
                 log.info(f"БД: run_id={run_id}, сохранено {len(saved_ids)} "
                          f"покрытий ({db.db_path})")
+
+                if inverse_design:
+                    best_coating_id = None
+                    rank1 = [c for c in db.list_coatings(run_id=run_id)
+                            if c.get('rank') == 1]
+                    if rank1:
+                        best_coating_id = rank1[0]['coating_id']
+                    target_id = db.create_design_target(
+                        f_lo_hz=float(params['target_f_lo_ghz']) * 1e9,
+                        f_hi_hz=float(params['target_f_hi_ghz']) * 1e9,
+                        rc_target_db=rc_threshold,
+                        max_thickness_mm=float(params['target_max_thickness_mm']),
+                        allowed_material_ids=material_ids,
+                        comment=f"run_id={run_id}",
+                    )
+                    db.set_design_target_result(target_id, best_coating_id)
+                    if best_coating_id:
+                        log.info(f"Inverse Design: цель target_id={target_id} → "
+                                f"лучшее покрытие coating_id={best_coating_id}")
+                    else:
+                        log.warning(f"Inverse Design: цель target_id={target_id} — "
+                                   f"подходящего покрытия не найдено.")
+
+                db.close()
             except Exception as exc:
                 log.warning(f"Не удалось сохранить результаты в БД: {exc}")
 
@@ -231,8 +359,14 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         write_csv(csv_path, all_configs, N_max_layers)
         plot_pareto_front(valid_configs or all_configs, pareto_path,
                           rc_threshold=rc_threshold)
+        pareto_xlsx_path = os.path.join(output_dir, 'pareto_front.xlsx')
+        try:
+            save_pareto_front_xlsx(valid_configs or all_configs, pareto_xlsx_path,
+                                   rc_threshold=rc_threshold)
+        except Exception as exc:
+            log.warning(f"Не удалось сохранить XLSX фронта Парето: {exc}")
 
-        # ── Сохранить PNG для топ-конфигураций ───────────────────────────────
+        # ── Сохранить PNG + XLSX для топ-конфигураций ────────────────────────
         pool    = valid_configs if valid_configs else all_configs
         to_plot = list(pool[:3])
         for special in [min(pool, key=lambda c: c['max_rc'],   default=None),
@@ -244,9 +378,16 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             tag = (f"rank{cfg.get('rank', '?')}_{cfg['n_layers']}L_"
                    f"rc{cfg['max_rc']:+.1f}dB_{cfg['total_mm']:.1f}mm"
                    ).replace('+', 'p').replace('-', 'm')
-            plot_rc_for_config(cfg, freqs, mat_arrays, material_names,
+            plot_rc_for_config(cfg, freqs, mat_arrays_full, material_names,
                                filename=os.path.join(output_dir, f"config_{tag}.png"),
                                rc_threshold=rc_threshold)
+            try:
+                save_config_spectrum_xlsx(
+                    cfg, freqs, mat_arrays_full, material_names,
+                    filename=os.path.join(output_dir, f"config_{tag}.xlsx"),
+                    rc_threshold=rc_threshold)
+            except Exception as exc:
+                log.warning(f"Не удалось сохранить XLSX для {tag}: {exc}")
 
         # ── Статистика ────────────────────────────────────────────────────────
         log.info("\n" + "=" * 55)
@@ -270,7 +411,7 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         log.info("Готово.")
 
         # ── Передать результаты для окна предпросмотра ────────────────────────
-        result_cb(pool, freqs, mat_arrays, material_names, rc_threshold)
+        result_cb(pool, freqs, mat_arrays_full, material_names, rc_threshold)
         done_cb(True, summary)
 
     except Exception as exc:

@@ -1,0 +1,4 @@
+2026-08-05 12:01:56,238  INFO      БД инициализирована: f:\App\Python\coatings\ga_c\AbsorberOptimizer_v4\rc_absorber.db
+2026-08-05 12:01:57,017  INFO      БД инициализирована: f:\App\Python\coatings\ga_c\AbsorberOptimizer_v4\rc_absorber.db
+2026-08-05 12:03:07,314  INFO      Обучение завершено: {'n_samples': 2385, 'n_train': 1908, 'n_test': 477, 'mae_curve_db_mean': 1.971, 'r2_curve': 0.812, 'mae_max_rc_db': 1.181}
+2026-08-05 12:03:08,006  INFO      Модель сохранена: f:\App\Python\coatings\ga_c\AbsorberOptimizer_v4\surrogate_model

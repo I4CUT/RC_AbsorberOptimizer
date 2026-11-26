@@ -2,22 +2,25 @@
 plotting.py — функции построения графиков
 
 Содержит:
-  • plot_rc_for_config  — RC(f) + стек слоёв + чувствительность → PNG
-  • plot_pareto_front   — фронт Парето RC vs толщина → PNG
-  • make_config_figure  — то же, что plot_rc_for_config, но возвращает Figure
-                         (для окна предпросмотра без сохранения файла)
+  • plot_rc_for_config        — RC(f) + стек слоёв + чувствительность → PNG
+  • plot_pareto_front         — фронт Парето RC vs толщина → PNG
+  • make_config_figure        — то же, что plot_rc_for_config, но возвращает
+                                Figure (для окна предпросмотра без сохранения)
+  • save_config_spectrum_xlsx — данные спектра RC(f) конкретного покрытия → XLSX
+  • save_pareto_front_xlsx    — данные всех конфигураций и фронта Парето → XLSX
 """
 
 import os
 import logging
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from physics import tmm_reflection, compute_bandwidth
+from physics import tmm_reflection, compute_bandwidth, effective_layer_count
 
 log = logging.getLogger("rc_opt")
 
@@ -65,10 +68,12 @@ def _draw_config_figure(cfg: dict,
                        label=f'Полоса = {bw:.2f} ГГц')
     ax_rc.set_xlabel('Частота (ГГц)', fontsize=12)
     ax_rc.set_ylabel('RC (дБ)', fontsize=12)
+    eff_n = cfg.get('n_layers_effective', effective_layer_count(sequence))
+    n_note = (f"   [физич. слоёв: {eff_n}]" if eff_n != len(sequence) else "")
     ax_rc.set_title(
         f"Ранг #{cfg.get('rank', '?')}   "
         f"max RC = {max_rc_actual:+.1f} дБ   "
-        f"толщина = {cfg['total_mm']:.1f} мм",
+        f"толщина = {cfg['total_mm']:.1f} мм{n_note}",
         fontsize=11, fontweight='bold')
     ax_rc.legend(fontsize=10)
     ax_rc.grid(True, alpha=0.35)
@@ -80,6 +85,20 @@ def _draw_config_figure(cfg: dict,
     ax_st.axis('off')
     ax_st.set_title('Стек слоёв\n(воздух → металл)', fontsize=10, fontweight='bold')
 
+    # Объединить подряд идущие слои одного материала в один визуальный блок.
+    # Физически несколько слоёв одного материала подряд неотличимы от одного
+    # более толстого слоя (см. physics.effective_layer_count) — рисовать их
+    # как отдельные "слои" с ложными границами вводит в заблуждение. Обычные
+    # результаты нового поиска такого не содержат (алгоритм это больше не
+    # допускает), но старые прогоны из БД могут.
+    segments = []
+    for mi, h in zip(sequence, hs):
+        if segments and segments[-1]['mat'] == mi:
+            segments[-1]['h']     += h
+            segments[-1]['count'] += 1
+        else:
+            segments.append({'mat': mi, 'h': h, 'count': 1})
+
     total_h = sum(hs)
     bar_w   = 0.42
     x0      = 0.52
@@ -88,15 +107,16 @@ def _draw_config_figure(cfg: dict,
     ax_st.text(x0 + bar_w / 2, 0.97, 'ВОЗДУХ', ha='center', va='top',
                fontsize=8, color='gray', fontstyle='italic')
 
-    for l in range(len(sequence)):
-        mi    = sequence[l] - 1
-        bh    = max(hs[l] / total_h * plot_h, 0.02)
+    for seg in segments:
+        mi    = seg['mat'] - 1
+        bh    = max(seg['h'] / total_h * plot_h, 0.02)
         color = _CMAP(mi % 10)
         ax_st.add_patch(plt.Rectangle((x0, y_cur - bh), bar_w, bh,
                                       color=color, alpha=0.85,
                                       lw=0.8, edgecolor='black'))
+        merge_note = f" (×{seg['count']} слипш.)" if seg['count'] > 1 else ""
         ax_st.text(x0 + bar_w + 0.03, y_cur - bh / 2,
-                   f"#{sequence[l]}\n{hs[l]*1000:.1f} мм",
+                   f"#{seg['mat']}\n{seg['h']*1000:.1f} мм{merge_note}",
                    va='center', fontsize=8)
         y_cur -= bh
 
@@ -177,6 +197,106 @@ def make_config_figure(cfg: dict,
     Вызывающий код обязан закрыть Figure после использования.
     """
     return _draw_config_figure(cfg, freqs, mat_arrays, material_names, rc_threshold)
+
+
+def save_config_spectrum_xlsx(cfg: dict,
+                              freqs: np.ndarray,
+                              mat_arrays: dict,
+                              material_names: list,
+                              filename: str = 'config.xlsx',
+                              rc_threshold: float = -10.0) -> None:
+    """
+    Сохранить данные спектра RC(f) конкретного покрытия в файл XLSX.
+
+    Содержит 3 листа:
+      • RC_spectrum — Частота (Гц/ГГц) и RC (дБ) по всем точкам сетки
+      • Слои        — состав покрытия (материал, толщина по слоям)
+      • Сводка      — ранг, оценка, число слоёв, суммарная толщина,
+                       max RC, ширина полосы
+    """
+    sequence = cfg['sequence']
+    hs       = cfg['hs']
+    sens     = cfg.get('sensitivity', {})
+
+    RC = tmm_reflection(freqs, sequence, hs, mat_arrays)
+    bw = compute_bandwidth(RC, freqs, threshold=rc_threshold)
+    eff_n = cfg.get('n_layers_effective', effective_layer_count(sequence))
+
+    df_spectrum = pd.DataFrame({
+        'Частота (ГГц)': freqs / 1e9,
+        'Частота (Гц)':  freqs,
+        'RC (дБ)':       RC,
+    })
+
+    dRC = sens.get('per_layer_dRC', [])
+    layer_rows = []
+    for i, (mat_idx, h) in enumerate(zip(sequence, hs), start=1):
+        name = (material_names[mat_idx - 1]
+                if mat_idx - 1 < len(material_names) else f'Материал {mat_idx}')
+        layer_rows.append({
+            'Слой':               i,
+            'Материал (индекс)':  mat_idx,
+            'Материал (имя)':     name,
+            'Толщина (мм)':       h * 1000,
+            'Чувствительность δRC (дБ)': dRC[i - 1] if i - 1 < len(dRC) else None,
+        })
+    df_layers = pd.DataFrame(layer_rows)
+
+    df_summary = pd.DataFrame([{
+        'Ранг':                cfg.get('rank', ''),
+        'Оценка':              cfg.get('score', ''),
+        'Число слоёв (заявлено)': cfg['n_layers'],
+        'Физич. слоёв':        eff_n,
+        'Суммарная толщина (мм)': cfg['total_mm'],
+        'Max RC (дБ)':         float(np.max(RC)),
+        f'Полоса <{rc_threshold:.0f}дБ (ГГц)': bw,
+        'Робастных слоёв':     sens.get('robust_score', ''),
+    }])
+
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df_summary.to_excel(writer, sheet_name='Сводка', index=False)
+        df_layers.to_excel(writer, sheet_name='Слои', index=False)
+        df_spectrum.to_excel(writer, sheet_name='RC_spectrum', index=False)
+
+    log.info(f"  XLSX сохранён: {filename}")
+
+
+def save_pareto_front_xlsx(configs: list,
+                           filename: str = 'pareto_front.xlsx',
+                           rc_threshold: float = -10.0) -> None:
+    """
+    Сохранить данные фронта Парето (все конфигурации + отдельно точки
+    фронта ранга 1) в файл XLSX.
+    """
+    if not configs:
+        return
+
+    rows = []
+    for cfg in configs:
+        eff_n = cfg.get('n_layers_effective', effective_layer_count(cfg['sequence']))
+        rows.append({
+            'Ранг':                    cfg.get('rank', ''),
+            'Оценка':                  cfg.get('score', ''),
+            'Число слоёв (заявлено)':  cfg['n_layers'],
+            'Физич. слоёв':            eff_n,
+            'Последовательность':      ' → '.join(str(s) for s in cfg['sequence']),
+            'Толщины слоёв (мм)':      ', '.join(f'{h*1000:.2f}' for h in cfg['hs']),
+            'Суммарная толщина (мм)':  cfg['total_mm'],
+            'Max RC (дБ)':             cfg['max_rc'],
+            'Полоса (ГГц)':            cfg.get('bandwidth_ghz', ''),
+        })
+    df_all = pd.DataFrame(rows)
+
+    pareto = sorted([c for c in configs if c.get('rank') == 1],
+                    key=lambda c: c['total_mm'])
+    df_pareto = df_all[df_all['Ранг'] == 1].sort_values('Суммарная толщина (мм)') \
+                if pareto else pd.DataFrame(columns=df_all.columns)
+
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df_pareto.to_excel(writer, sheet_name='Фронт Парето', index=False)
+        df_all.to_excel(writer, sheet_name='Все конфигурации', index=False)
+
+    log.info(f"  XLSX фронта Парето: {filename}")
 
 
 def plot_pareto_front(configs: list, filename: str = 'pareto_front.png',
