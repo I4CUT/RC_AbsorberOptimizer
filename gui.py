@@ -210,7 +210,7 @@ class App:
         self._var_layers = tk.IntVar(value=3)
         ttk.Label(grp_layers, text="Макс. число слоёв:",
                   style="Dark.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Spinbox(grp_layers, from_=1, to=10,
+        tk.Spinbox(grp_layers, from_=1, to=999,
                    textvariable=self._var_layers, width=5,
                    bg=ENTRY_BG, fg=FG, font=FONT,
                    relief="sunken", bd=2, buttonbackground=BG_DARK

@@ -53,8 +53,24 @@ import numpy as np
 
 log = logging.getLogger("rc_opt")
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "rc_absorber.db")
+import sys
+
+def _default_app_dir() -> str:
+    """
+    Папка, рядом с которой по умолчанию хранится файл БД.
+
+    При обычном запуске (`python main.py`) — папка со скриптами.
+    При сборке в исполняемый файл (PyInstaller --onefile/--onedir) —
+    папка, где лежит сам .exe, а НЕ временная папка распаковки
+    (sys._MEIPASS): она удаляется при каждом закрытии программы, и без
+    этой проверки вся накопленная история терялась бы при каждом перезапуске.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DEFAULT_DB_PATH = os.path.join(_default_app_dir(), "rc_absorber.db")
 
 _SCHEMA = """
 PRAGMA foreign_keys = ON;

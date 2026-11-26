@@ -28,7 +28,6 @@ Design поведение не меняется — используется о�
 
 from __future__ import annotations
 
-import itertools
 import logging
 import random
 
@@ -44,27 +43,77 @@ log = logging.getLogger("rc_opt")
 MAX_SEQUENCES_TO_SCORE = 2000
 
 
+def _sequences_no_adjacent_dup(num_materials: int, n_layers: int):
+    """
+    Генератор всех последовательностей длины n_layers БЕЗ соседних повторов
+    материала (см. docstring enumerate_sequences ниже про физический смысл).
+    """
+    if n_layers == 0:
+        yield ()
+        return
+
+    def rec(prefix: tuple):
+        if len(prefix) == n_layers:
+            yield prefix
+            return
+        last = prefix[-1] if prefix else None
+        for m in range(1, num_materials + 1):
+            if m != last:
+                yield from rec(prefix + (m,))
+
+    yield from rec(())
+
+
 def enumerate_sequences(num_materials: int, n_layers: int,
                         rng: random.Random | None = None) -> list:
     """
-    Вернуть список всех последовательностей материалов длины n_layers
-    (1-based индексы, как всюду в physics.py), либо случайную выборку из них,
-    если полный перебор превышает MAX_SEQUENCES_TO_SCORE.
+    Вернуть список последовательностей материалов длины n_layers (1-based
+    индексы, как всюду в physics.py) БЕЗ соседних повторов одного материала,
+    либо случайную выборку из них, если полный перебор превышает
+    MAX_SEQUENCES_TO_SCORE.
+
+    Соседние повторы одного материала физически эквивалентны одному более
+    толстому слою: TMM-матрица слоя мультипликативна по толщине при
+    одинаковых γ, ν (M(h1)·M(h2) = M(h1+h2)) — новой границы раздела там
+    нет (см. physics._repair_adjacent_duplicates, где обычный честный
+    nsga2_optimise() исключает такие повторы точно так же). Включать их в
+    перебор/выборку здесь бессмысленно: они лишь тратят бюджет
+    MAX_SEQUENCES_TO_SCORE и предложат честному DE физически вырожденные
+    "n-слойные" структуры, реально содержащие меньше n различимых слоёв —
+    именно та ошибка, которая раньше приводила к завышенному числу слоёв
+    в отчётах.
     """
-    total = num_materials ** n_layers
+    if num_materials < 2:
+        if n_layers > 1:
+            log.warning(
+                f"  Seed-proposer: доступен только 1 материал — все n_layers "
+                f"«слоёв» физически эквивалентны одному слою.")
+        return [tuple([1] * n_layers)] if num_materials == 1 else []
+
+    # Число последовательностей БЕЗ соседних повторов: num_materials вариантов
+    # для первого слоя, (num_materials-1) — для каждого следующего.
+    total = num_materials * (num_materials - 1) ** (n_layers - 1) if n_layers > 0 else 1
+
     if total <= MAX_SEQUENCES_TO_SCORE:
-        return list(itertools.product(range(1, num_materials + 1), repeat=n_layers))
+        return list(_sequences_no_adjacent_dup(num_materials, n_layers))
 
     rng = rng or random.Random(42)
     seen = set()
-    out = []
-    while len(out) < MAX_SEQUENCES_TO_SCORE:
-        seq = tuple(rng.randint(1, num_materials) for _ in range(n_layers))
+    out  = []
+    attempts, max_attempts = 0, MAX_SEQUENCES_TO_SCORE * 50
+    while len(out) < MAX_SEQUENCES_TO_SCORE and attempts < max_attempts:
+        attempts += 1
+        seq = [rng.randint(1, num_materials)]
+        for _ in range(n_layers - 1):
+            choices = [m for m in range(1, num_materials + 1) if m != seq[-1]]
+            seq.append(rng.choice(choices))
+        seq = tuple(seq)
         if seq not in seen:
             seen.add(seq)
             out.append(seq)
-    log.info(f"  Seed-proposer: {total} возможных последовательностей — "
-            f"случайная выборка {MAX_SEQUENCES_TO_SCORE} вместо полного перебора.")
+    log.info(f"  Seed-proposer: {total} физически различимых последовательностей "
+            f"(без соседних повторов материала) — случайная выборка "
+            f"{len(out)} вместо полного перебора.")
     return out
 
 

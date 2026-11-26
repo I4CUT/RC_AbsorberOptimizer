@@ -342,6 +342,59 @@ def crowding_distance(front: list, objs: list) -> dict:
 # NSGA-II — главный цикл
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pick_different_material(exclude, num_materials: int) -> int:
+    """
+    Случайный материал (1..num_materials), отличный от exclude.
+
+    Если материалов меньше двух, различие невозможно — возвращаем случайный
+    (тогда физически несколько слоёв и не могут быть все различны, см.
+    предупреждение в nsga2_optimise()).
+    """
+    if num_materials <= 1 or exclude is None:
+        return random.randint(1, num_materials)
+    choices = [m for m in range(1, num_materials + 1) if m != exclude]
+    return random.choice(choices)
+
+
+def _repair_adjacent_duplicates(seq: list, num_materials: int) -> list:
+    """
+    Убрать соседние повторы материала в последовательности (изменяет seq
+    на месте и возвращает его же).
+
+    Физически: два (и более) ПОДРЯД идущих слоя ОДНОГО материала неотличимы
+    от одного более толстого слоя того же материала. Матрица слоя в TMM
+    мультипликативна по толщине при постоянных γ, ν одного материала —
+    M(h1)·M(h2) = M(h1+h2). Значит соседние повторы не образуют новую
+    границу раздела: они лишь тратят впустую «слот» хромосомы (ложно
+    завышая заявленное число слоёв в отчётах) и сужают эффективное
+    пространство поиска, вместо того чтобы кодировать n_layers НАСТОЯЩИХ
+    границ раздела. Однопроходный прогон слева направо гарантированно
+    убирает все соседние повторы при num_materials >= 2.
+    """
+    for k in range(1, len(seq)):
+        if seq[k] == seq[k - 1]:
+            seq[k] = _pick_different_material(seq[k - 1], num_materials)
+    return seq
+
+
+def effective_layer_count(sequence: tuple) -> int:
+    """
+    Число ФИЗИЧЕСКИ различимых слоёв в последовательности — то есть число
+    подряд идущих групп одинакового материала (см. _repair_adjacent_duplicates
+    про эквивалентность соседних повторов одному слою). Для последовательностей,
+    построенных через nsga2_optimise(), это всегда равно len(sequence); функция
+    служит защитной сверкой (в т.ч. для конфигураций из старых прогонов/БД или
+    из seed_proposer, построенных до этого исправления).
+    """
+    if not sequence:
+        return 0
+    count = 1
+    for k in range(1, len(sequence)):
+        if sequence[k] != sequence[k - 1]:
+            count += 1
+    return count
+
+
 def nsga2_optimise(n_layers: int, num_materials: int,
                    freqs: np.ndarray, mat_arrays: dict,
                    h_max_total: float,
@@ -375,8 +428,20 @@ def nsga2_optimise(n_layers: int, num_materials: int,
     pop_size    = max(30, 60 - n_layers * 3)
     h_max_per   = h_max_total / n_layers
 
+    if num_materials < 2 and n_layers > 1:
+        log.warning(
+            f"  [n={n_layers}] Доступен только 1 материал — все n_layers "
+            f"«слоёв» физически эквивалентны одному слою (см. "
+            f"effective_layer_count). Результат для n>1 будет дублировать n=1.")
+
     def rnd_seq():
-        return tuple(random.randint(1, num_materials) for _ in range(n_layers))
+        # Соседние повторы одного материала не создают новую физическую
+        # границу раздела (см. _repair_adjacent_duplicates) — строим
+        # последовательность так, чтобы каждая позиция была настоящим слоем.
+        seq = [random.randint(1, num_materials)]
+        for _ in range(n_layers - 1):
+            seq.append(_pick_different_material(seq[-1], num_materials))
+        return tuple(seq)
 
     def eval_seq(seq):
         try:
@@ -431,6 +496,11 @@ def nsga2_optimise(n_layers: int, num_materials: int,
             for k in range(n_layers):
                 if random.random() < mr:
                     child[k] = random.randint(1, num_materials)
+            # Кроссовер/мутация могут создать соседние повторы материала на
+            # стыке родителей или случайно — убираем их, чтобы каждая позиция
+            # хромосомы оставалась настоящей границей раздела (см.
+            # _repair_adjacent_duplicates).
+            child = _repair_adjacent_duplicates(child, num_materials)
             offspring.append(tuple(child))
 
         off_hs   = [None] * pop_size
@@ -535,7 +605,20 @@ def compute_bandwidth(RC: np.ndarray, freqs: np.ndarray,
 def rank_configurations(configs: list, rc_threshold: float = RC_THRESHOLD) -> list:
     """
     Разделить конфигурации на валидные (RC <= rc_threshold) и невалидные,
-    вычислить нормированную оценку, отсортировать.
+    построить НАСТОЯЩИЙ фронт Парето по двум целям (max_rc, total_mm) через
+    недоминируемую сортировку (та же non_dominated_sort(), что использует
+    NSGA-II внутри одного прогона), присвоить rank = номер фронта:
+    rank=1 — сам фронт Парето (может содержать НЕСКОЛЬКО конфигураций,
+    не одну!), rank=2 — следующий фронт после его удаления, и т.д.
+    Дополнительно считаем единый нормированный score — для сортировки
+    внутри фронта и для отчётов/CSV.
+
+    Раньше rank был просто порядковым номером (1..N) по единой взвешенной
+    оценке score — это НЕ фронт Парето, а тотальный порядок, при котором
+    rank==1 получала ровно одна, глобально лучшая по score конфигурация.
+    Из-за этого график фронта Парето показывал только одну точку (линии
+    фронта визуально не было, хотя подпись в легенде оставалась) — сам
+    фронт как множество недоминируемых решений никогда не строился.
     """
     if not configs:
         return configs
@@ -555,9 +638,19 @@ def rank_configurations(configs: list, rc_threshold: float = RC_THRESHOLD) -> li
         for cfg in valid:
             cfg['score'] = (0.7 * (cfg['max_rc']  - rc_min) / rc_span +
                             0.3 * (cfg['total_mm'] - th_min) / th_span)
-        valid.sort(key=lambda x: x['score'])
-        for rank, cfg in enumerate(valid, 1):
-            cfg['rank'] = rank
+
+        objs   = [[c['max_rc'], c['total_mm']] for c in valid]
+        fronts = non_dominated_sort(objs)
+        log.info(f"  Фронт Парето (rank=1): {len(fronts[0])} конфигураций "
+                 f"из {len(valid)} валидных; всего фронтов: {len(fronts)}")
+        for front_no, front in enumerate(fronts, 1):
+            cd = crowding_distance(front, objs)
+            for i in front:
+                valid[i]['rank'] = front_no
+                valid[i]['crowding'] = cd[i]
+        # Внутри фронта — по crowding distance (разрежённые решения раньше),
+        # между фронтами — по номеру фронта; score — вторичный тай-брейк.
+        valid.sort(key=lambda c: (c['rank'], -c['crowding'], c['score']))
     for cfg in invalid:
         cfg['score'] = float('inf')
         cfg['rank']  = None
@@ -594,7 +687,7 @@ def load_material_data(folder_path: str):
 
 def write_csv(output_file: str, configs: list, N_max_layers: int) -> None:
     """Сохранить все конфигурации в CSV с разделителями ; и BOM для Excel."""
-    header = ['Ранг', 'Оценка', 'Число слоёв']
+    header = ['Ранг', 'Оценка', 'Число слоёв (заявлено)', 'Физич. слоёв']
     for i in range(N_max_layers):
         header += [f'Слой {i+1} материал', f'Слой {i+1} h (мм)']
     header += ['Max RC (дБ)', 'Суммарная h (мм)',
@@ -606,11 +699,12 @@ def write_csv(output_file: str, configs: list, N_max_layers: int) -> None:
         for cfg in configs:
             seq  = cfg['sequence']; hs = cfg['hs']; n = len(seq)
             sens = cfg.get('sensitivity', {})
+            eff_n = cfg.get('n_layers_effective', effective_layer_count(seq))
             
             rank = cfg.get('rank', '')
             score = round(cfg.get('score', 0), 4) if cfg.get('rank') is not None else ''
             
-            row  = [rank, score, n]
+            row  = [rank, score, n, eff_n]
             for i in range(N_max_layers):
                 if i < n:
                     row += [seq[i], round(hs[i] * 1000, 1)]

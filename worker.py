@@ -19,9 +19,13 @@ from physics import (
     tmm_reflection, write_csv, RC_THRESHOLD,
     H_MIN, LAMBDA_MULTIPLIER_DEFAULT,
     validate_rc_threshold, validate_lambda_multiplier,
+    effective_layer_count,
     _mat_arrays_counter,
 )
-from plotting import plot_rc_for_config, plot_pareto_front
+from plotting import (
+    plot_rc_for_config, plot_pareto_front,
+    save_config_spectrum_xlsx, save_pareto_front_xlsx,
+)
 from database import Database
 
 log = logging.getLogger("rc_opt")
@@ -277,8 +281,16 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
                     sens = sensitivity_analysis(seq, hs, freqs_search, mat_arrays_search)
                 except Exception:
                     sens = {}
+                eff_n = effective_layer_count(seq)
+                if eff_n != n_layers:
+                    log.warning(
+                        f"  seq={seq}: заявлено {n_layers} слоёв, но физически "
+                        f"различимых только {eff_n} (соседние слои одного "
+                        f"материала эквивалентны в TMM одному более толстому "
+                        f"слою). Используйте 'n_layers_effective' в отчётах.")
                 all_configs.append({
-                    'n_layers': n_layers, 'sequence': seq, 'hs': hs,
+                    'n_layers': n_layers, 'n_layers_effective': eff_n,
+                    'sequence': seq, 'hs': hs,
                     'max_rc': max_rc, 'total_mm': th,
                     'bandwidth_ghz': bw, 'sensitivity': sens,
                 })
@@ -347,8 +359,14 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
         write_csv(csv_path, all_configs, N_max_layers)
         plot_pareto_front(valid_configs or all_configs, pareto_path,
                           rc_threshold=rc_threshold)
+        pareto_xlsx_path = os.path.join(output_dir, 'pareto_front.xlsx')
+        try:
+            save_pareto_front_xlsx(valid_configs or all_configs, pareto_xlsx_path,
+                                   rc_threshold=rc_threshold)
+        except Exception as exc:
+            log.warning(f"Не удалось сохранить XLSX фронта Парето: {exc}")
 
-        # ── Сохранить PNG для топ-конфигураций ───────────────────────────────
+        # ── Сохранить PNG + XLSX для топ-конфигураций ────────────────────────
         pool    = valid_configs if valid_configs else all_configs
         to_plot = list(pool[:3])
         for special in [min(pool, key=lambda c: c['max_rc'],   default=None),
@@ -363,6 +381,13 @@ def run_optimisation(params: dict, progress_cb, done_cb, result_cb) -> None:
             plot_rc_for_config(cfg, freqs, mat_arrays_full, material_names,
                                filename=os.path.join(output_dir, f"config_{tag}.png"),
                                rc_threshold=rc_threshold)
+            try:
+                save_config_spectrum_xlsx(
+                    cfg, freqs, mat_arrays_full, material_names,
+                    filename=os.path.join(output_dir, f"config_{tag}.xlsx"),
+                    rc_threshold=rc_threshold)
+            except Exception as exc:
+                log.warning(f"Не удалось сохранить XLSX для {tag}: {exc}")
 
         # ── Статистика ────────────────────────────────────────────────────────
         log.info("\n" + "=" * 55)
